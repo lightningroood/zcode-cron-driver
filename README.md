@@ -59,7 +59,7 @@ node zcode-cron-driver.mjs
 | `--dry-run` | claim → log → release; never dispatches |
 | `--db <path>` | task index (default `~/.zcode/v2/tasks-index.sqlite`) |
 | `--server-url <url>` | default `ws://127.0.0.1:3030/ws` |
-| `--token <t>` | default discovered from `ZCODE_SERVER_AUTH_TOKEN` or the server process env |
+| `--token <t>` | server auth token; when given it is used as-is (discovery off). Default: discovered from `ZCODE_SERVER_AUTH_TOKEN` or the server process env |
 | `--timeout-ms <n>` | per-dispatch timeout, default 30 min |
 
 Automations are created as usual from any zcode session (`CronCreate`) and

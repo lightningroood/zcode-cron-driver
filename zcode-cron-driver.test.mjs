@@ -694,6 +694,24 @@ test("ws codec: masked client frames round-trip and split server frames decode",
   }
 });
 
+test("explicit token overrides discovery resolver", async () => {
+  const { server, state } = startFakeWsServer();
+  const capUrls = [];
+  const dispatcher = makeProtocolDispatcher({
+    url: "ws://127.0.0.1:3030/ws",
+    token: "explicit-token",
+    tokenResolver: () => "discovered-token",
+    timeoutMs: 2000,
+    pollIntervalMs: 10,
+    graceMs: 30,
+    fetchImpl: async (url) => { capUrls.push(url); return { ok: true, json: async () => ({ capability: "c" }) }; },
+    socketFactory: (url, opts) => { state.onmessage = opts.onMessage; state.onopen = opts.onOpen; server.open(); return server; },
+  });
+  state.activeTurnIdFn = () => undefined;
+  await dispatcher({ automationId: "a", targetTaskId: "s", workspacePath: "/w", workspaceKey: "k", mode: null, prompt: "p" });
+  assert.ok(capUrls.length > 0 && capUrls[0].includes("token=explicit-token"), `got ${capUrls[0]}`);
+});
+
 test("ws transport: trusted-host route fetches a capability ticket first", async () => {
   const { server, state } = startFakeWsServer();
   const fetchCalls = [];

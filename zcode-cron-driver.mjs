@@ -31,7 +31,7 @@
 //     --lock-file <path>   singleton lock (default ~/.local/state/zcode-cron-driver.lock)
 //     --dry-run            claim, log, release — no dispatch, no state changes
 //     --server-url <url>   harness server ws endpoint (default ws://127.0.0.1:3030/ws)
-//     --token <token>      server auth token (default: discovered automatically)
+//     --token <token>      server auth token; when given, auto-discovery is off
 //
 // Dispatch executes: zcode [--resume <bound session>] --cwd <workspace>
 //                      [--mode <mode>] -p "<prompt>"
@@ -1274,7 +1274,8 @@ export function makeProtocolDispatcher({
     if (!connecting) {
       connecting = connectOverWebSocket({
         url,
-        token: tokenResolver ? tokenResolver() : token,
+        // explicit token wins; discover only when none was provided
+        token: token ?? (tokenResolver ? tokenResolver() : null),
         socketFactory,
         fetchImpl,
         handshakeTimeoutMs: connectTimeoutMs,
