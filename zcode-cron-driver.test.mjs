@@ -3,7 +3,7 @@
 // Run: node zcode-cron-driver.test.mjs (from this file's directory)
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -855,4 +855,28 @@ test("protocol dispatcher: connect failure settles as a transient dispatch failu
 test("discoverServerToken: env wins, /proc scan as fallback", () => {
   const viaEnv = discoverServerToken({ env: { ZCODE_SERVER_AUTH_TOKEN: "abc" }, procRoot: "/nonexistent" });
   assert.equal(viaEnv, "abc");
+});
+
+test("discoverServerToken: picks the entry-http process listening on the server port", () => {
+  // synthetic /proc: pid 100 owns the listening socket on :3030 (0xBD6), pid 200 is a stale server
+  const dir = mkdtempSync(join(tmpdir(), "zproc-"));
+  try {
+    mkdirSync(join(dir, "net"), { recursive: true });
+    // sl local_address rem_address st inode — LISTEN (0A) on 0.0.0.0:0BD6
+    writeFileSync(join(dir, "net", "tcp"),
+      "  sl  local_address rem_address   st tx_queue inode  " + "\n" +
+      "   0: 00000000:0BD6 00000000:0000 0A 00000000:00000000 00:00000000 0 1000 0 4242 0 0" + "\n");
+    for (const [pid, token, ownsSocket] of [["100", "right-token", true], ["200", "stale-token", false]]) {
+      const pdir = join(dir, pid);
+      mkdirSync(join(pdir, "fd"), { recursive: true });
+      writeFileSync(join(pdir, "environ"),
+        Buffer.from(`ZCODE_SERVER_AUTH_TOKEN=${token} node entry-http.js `, "utf8"));
+      if (ownsSocket) symlinkSync("socket:[4242]", join(pdir, "fd", "3"));
+      else symlinkSync("socket:[9999]", join(pdir, "fd", "3"));
+    }
+    const token = discoverServerToken({ env: {}, procRoot: dir, serverUrl: "ws://127.0.0.1:3030/ws" });
+    assert.equal(token, "right-token");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

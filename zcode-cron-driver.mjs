@@ -38,7 +38,7 @@
 import { DatabaseSync } from "node:sqlite";
 import http from "node:http";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, openSync, readFileSync, readdirSync, unlinkSync, writeSync, closeSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, unlinkSync, writeSync, closeSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -1156,21 +1156,67 @@ export async function connectOverWebSocket({
   return { client, close: () => { try { socket?.close?.(); } catch {} } };
 }
 
-/** Find the harness server auth token: env first, then the running server's environ. */
-export function discoverServerToken({ env = process.env, procRoot = "/proc" } = {}) {
+/** Find the harness server auth token: env first, then the environ of the
+ * entry-http process actually LISTENING on the server port (a restarting
+ * server changes its token, and stale dying processes must not win). */
+export function discoverServerToken({ env = process.env, procRoot = "/proc", serverUrl = null } = {}) {
   const fromEnv = env.ZCODE_SERVER_AUTH_TOKEN?.trim();
   if (fromEnv) return fromEnv;
   try {
-    for (const pid of readdirSync(procRoot).filter((d) => /^\d+$/.test(d))) {
-      try {
-        const environ = readFileSync(`${procRoot}/${pid}/environ`);
-        if (!environ.includes("entry-http")) continue;
-        const match = environ.toString("utf8").split("\0").find((kv) => kv.startsWith("ZCODE_SERVER_AUTH_TOKEN="));
-        if (match) return match.slice("ZCODE_SERVER_AUTH_TOKEN=".length).trim();
-      } catch {}
+    const port = serverUrl ? new URL(serverUrl).port : null;
+    const listeningInodes = port ? collectListeningInodes(procRoot, Number(port)) : new Set();
+    const pids = readdirSync(procRoot).filter((d) => /^\d+$/.test(d));
+    // two passes: exact port owner first, then any entry-http as fallback
+    for (const requireSocket of [true, false]) {
+      for (const pid of pids) {
+        try {
+          const pdir = `${procRoot}/${pid}`;
+          const environ = readFileSync(`${pdir}/environ`);
+          if (!environ.includes("entry-http")) continue;
+          if (requireSocket && !ownsListeningSocket(pdir, listeningInodes)) continue;
+          const match = environ.toString("utf8").split("\0").find((kv) => kv.startsWith("ZCODE_SERVER_AUTH_TOKEN="));
+          if (match) return match.slice("ZCODE_SERVER_AUTH_TOKEN=".length).trim();
+        } catch {}
+      }
+      if (listeningInodes.size > 0 && requireSocket) continue; // try fallback pass
+      break;
     }
   } catch {}
   return null;
+}
+
+function collectListeningInodes(procRoot, port) {
+  const inodes = new Set();
+  const hexPort = port.toString(16).toUpperCase().padStart(4, "0");
+  for (const file of ["net/tcp", "net/tcp6"]) {
+    try {
+      const table = readFileSync(`${procRoot}/${file}`, "utf8");
+      for (const line of table.split("\n").slice(1)) {
+        const cols = line.trim().split(/\s+/);
+        // cols: sl local_address rem_address st ...
+        if (cols.length < 10) continue;
+        const [addr, p] = cols[1].split(":");
+        if (p !== hexPort) continue;
+        if (cols[3] !== "0A") continue; // LISTEN only
+        inodes.add(cols[9]);
+      }
+    } catch {}
+  }
+  return inodes;
+}
+
+function ownsListeningSocket(pdir, listeningInodes) {
+  if (listeningInodes.size === 0) return false;
+  try {
+    for (const fd of readdirSync(`${pdir}/fd`)) {
+      try {
+        const link = readlinkSync(`${pdir}/fd/${fd}`);
+        const m = link.match(/^socket:\[(\d+)\]$/);
+        if (m && listeningInodes.has(m[1])) return true;
+      } catch {}
+    }
+  } catch {}
+  return false;
 }
 
 async function pollTurnCompletion(client, sessionTarget, runId, timeoutMs, pollIntervalMs, graceMs, logger) {
@@ -1207,6 +1253,7 @@ async function pollTurnCompletion(client, sessionTarget, runId, timeoutMs, pollI
 export function makeProtocolDispatcher({
   url = "ws://127.0.0.1:3030/ws",
   token = null,
+  tokenResolver = null,
   timeoutMs = DEFAULT_DISPATCH_TIMEOUT_MS,
   socketFactory = null,
   fetchImpl = null,
@@ -1222,7 +1269,14 @@ export function makeProtocolDispatcher({
   const getConnection = async () => {
     if (connection) return connection;
     if (!connecting) {
-      connecting = connectOverWebSocket({ url, token, socketFactory, fetchImpl, handshakeTimeoutMs: connectTimeoutMs, log: logger })
+      connecting = connectOverWebSocket({
+        url,
+        token: tokenResolver ? tokenResolver() : token,
+        socketFactory,
+        fetchImpl,
+        handshakeTimeoutMs: connectTimeoutMs,
+        log: logger,
+      })
         .then((conn) => {
           connection = conn;
           return conn;
@@ -1429,7 +1483,8 @@ export async function main(argv = process.argv.slice(2)) {
 
   const dispatch = makeProtocolDispatcher({
     url: opts.serverUrl,
-    token: opts.token ?? discoverServerToken(),
+    token: opts.token,
+    tokenResolver: () => discoverServerToken({ serverUrl: opts.serverUrl }),
     timeoutMs: opts.timeoutMs,
     log,
   });
