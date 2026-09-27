@@ -650,6 +650,14 @@ function startFakeWsServer() {
       const body = rest.length ? deserializeRpcValue(rest).value : undefined;
       const [type, id, , command] = header;
       if (type === 100) {
+        if (command === "createSession") {
+          state.createdSession = state.createdSession ?? "sess-fresh-1";
+          setTimeout(() => state.onmessage?.({ data: encodeFrame(1, 0, 0, bytesOf([201, id], {
+            session: { sessionId: state.createdSession, status: "idle" },
+            runtime: { pendingRequestIds: [] },
+          })) }), 1);
+          return;
+        }
         if (command === "listSessions") {
           const ids = body[0].sessionIds ?? [];
           const list = (state.sessions ?? ids.map((id) => ({ sessionId: id, status: "idle" })));
@@ -821,6 +829,36 @@ test("protocol dispatcher: defers when target session is running (never dispatch
   });
   assert.equal(commands.includes("resumeSession"), false);
   assert.equal(commands.includes("sendPrompt"), false);
+});
+
+test("protocol dispatcher: unbound automation creates a fresh session and dispatches into it", async () => {
+  const { server, state } = startFakeWsServer();
+  state.activeTurnIdFn = () => undefined; // grace settle
+  const dispatcher = makeProtocolDispatcher({
+    url: "ws://127.0.0.1:3030/ws",
+    timeoutMs: 3000,
+    pollIntervalMs: 10,
+    graceMs: 30,
+    fetchImpl: async () => ({ ok: true, json: async () => ({ capability: "t" }) }),
+    socketFactory: (url, opts) => { state.onmessage = opts.onMessage; state.onopen = opts.onOpen; server.open(); return server; },
+  });
+  const result = await dispatcher({
+    automationId: "auto-u", targetTaskId: null, workspacePath: "/w", workspaceKey: "wk", mode: "yolo", prompt: "say hello",
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.sessionId, "sess-fresh-1");
+  const calls = state.sent.map((m) => {
+    const a = deserializeRpcValue(m.subarray(13));
+    const rest = m.subarray(13 + a.bytesConsumed);
+    const body = rest.length ? deserializeRpcValue(rest).value : undefined;
+    return { command: a.value[3], arg: body };
+  });
+  const created = calls.find((c) => c.command === "createSession");
+  assert.deepEqual(created.arg, [{ workspacePath: "/w", workspaceKey: "wk", mode: "yolo" }]);
+  const sent = calls.find((c) => c.command === "sendPrompt");
+  assert.equal(sent.arg[0].sessionId, "sess-fresh-1");
+  assert.equal(sent.arg[0].content, "say hello");
+  assert.equal(calls.some((c) => c.command === "resumeSession"), false);
 });
 
 test("protocol dispatcher: times out when the turn never finishes", async () => {

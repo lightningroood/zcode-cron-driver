@@ -1296,13 +1296,6 @@ export function makeProtocolDispatcher({
     if (automation.locationKind && automation.locationKind !== "local") {
       return { ok: false, error: `unsupported location_kind ${automation.locationKind}`, failureKind: "permanent" };
     }
-    const sessionId = automation.targetTaskId;
-    if (!sessionId) {
-      // desktop creates a fresh task for unbound automations; out of scope here —
-      // let the CLI dispatcher create a throwaway session instead
-      if (fallback) return fallback(automation);
-      return { ok: false, error: "automation has no bound session and no fallback dispatcher" };
-    }
     let conn;
     try {
       conn = await getConnection();
@@ -1311,12 +1304,13 @@ export function makeProtocolDispatcher({
       if (fallback) return fallback(automation);
       return { ok: false, error: `server connect failed: ${error.message}` };
     }
+    const boundSessionId = automation.targetTaskId ?? null;
     const scheduledAt = automation.nextRunAt ?? automation.retryAt ?? Date.now();
     const runId = `${automation.automationId}:${scheduledAt}`;
     // live-server contract (probed): every session-target service call takes the
     // same flat target incl. the harness-computed workspaceKey from the automation row
     const sessionTarget = {
-      sessionId,
+      sessionId: boundSessionId,
       workspacePath: automation.workspacePath,
       workspaceKey: automation.workspaceKey,
       ...(automation.workspaceIdentity ? { workspaceIdentity: automation.workspaceIdentity } : {}),
@@ -1325,25 +1319,44 @@ export function makeProtocolDispatcher({
     try {
       // safety: dispatching into an already-active session took down a whole
       // server once (resume/steer on a live runtime); busy targets defer instead
-      const sessions = await conn.client.call(AGENT_CHANNEL, "listSessions", [
-        {
-          workspacePath: automation.workspacePath,
-          workspaceKey: automation.workspaceKey,
-          sessionIds: [sessionId],
-        },
-      ]);
-      const info = Array.isArray(sessions) ? sessions.find((s) => s?.sessionId === sessionId) : undefined;
-      if (info?.status === "running") {
-        return { ok: false, error: `target session ${sessionId} is busy (running); deferring`, failureKind: "transient" };
+      if (boundSessionId) {
+        const sessions = await conn.client.call(AGENT_CHANNEL, "listSessions", [
+          {
+            workspacePath: automation.workspacePath,
+            workspaceKey: automation.workspaceKey,
+            sessionIds: [boundSessionId],
+          },
+        ]);
+        const info = Array.isArray(sessions) ? sessions.find((s) => s?.sessionId === boundSessionId) : undefined;
+        if (info?.status === "running") {
+          return { ok: false, error: `target session ${boundSessionId} is busy (running); deferring`, failureKind: "transient" };
+        }
       }
       const flow = (async () => {
-        await conn.client.call(AGENT_CHANNEL, "resumeSession", [sessionTarget]);
-        if (automation.mode) {
-          await conn.client.call(AGENT_CHANNEL, "setMode", [{ ...sessionTarget, mode: automation.mode }]);
+        // bound → resume the session; unbound → create a fresh one (desktop
+        // parity: the desktop host createTask's a new session for these)
+        let sessionId = boundSessionId;
+        if (sessionId) {
+          await conn.client.call(AGENT_CHANNEL, "resumeSession", [sessionTarget]);
+          if (automation.mode) {
+            await conn.client.call(AGENT_CHANNEL, "setMode", [{ ...sessionTarget, mode: automation.mode }]);
+          }
+        } else {
+          const created = await conn.client.call(AGENT_CHANNEL, "createSession", [
+            {
+              workspacePath: automation.workspacePath,
+              workspaceKey: automation.workspaceKey,
+              ...(automation.workspaceIdentity ? { workspaceIdentity: automation.workspaceIdentity } : {}),
+              ...(automation.mode ? { mode: automation.mode } : {}),
+            },
+          ]);
+          sessionId = created?.session?.sessionId;
+          if (!sessionId) throw new Error("createSession returned no session id");
         }
+        const target = { ...sessionTarget, sessionId };
         await conn.client.call(AGENT_CHANNEL, "sendPrompt", [
           {
-            ...sessionTarget,
+            ...target,
             content: automation.prompt,
             inputId: runId,
             clientMode: "desktop-continuous",
@@ -1357,7 +1370,8 @@ export function makeProtocolDispatcher({
         // readSessionEvents is equally unusable on this build: the write path
         // stores event payloads the read schema rejects. So: watch
         // runtime.activeTurnId — ours appearing then clearing = turn completed.
-        return await pollTurnCompletion(conn.client, sessionTarget, runId, timeoutMs, pollIntervalMs, graceMs, logger);
+        return await pollTurnCompletion(conn.client, { ...sessionTarget, sessionId }, runId, timeoutMs, pollIntervalMs, graceMs, logger)
+          .then((result) => ({ ...result, sessionId }));
       })();
       const event = await new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
@@ -1376,7 +1390,7 @@ export function makeProtocolDispatcher({
         );
       });
       if (event.outcome === "completed") {
-        return { ok: true, sessionId };
+        return { ok: true, sessionId: event.sessionId ?? sessionId };
       }
       return { ok: false, error: event.error ?? `turn outcome: ${event.outcome}` };
     } catch (error) {
