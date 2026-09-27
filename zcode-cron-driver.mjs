@@ -1166,16 +1166,19 @@ export function discoverServerToken({ env = process.env, procRoot = "/proc", ser
     const port = serverUrl ? new URL(serverUrl).port : null;
     const listeningInodes = port ? collectListeningInodes(procRoot, Number(port)) : new Set();
     const pids = readdirSync(procRoot).filter((d) => /^\d+$/.test(d));
-    // two passes: exact port owner first, then any entry-http as fallback
+    // Two passes: the process OWNING the listening socket on the server port
+    // first, then any process carrying the token (every server child inherits
+    // the same token, so any match is the right value). No process-name filter:
+    // matching on "entry-http" in environ only worked by launcher accident.
     for (const requireSocket of [true, false]) {
       for (const pid of pids) {
         try {
           const pdir = `${procRoot}/${pid}`;
           const environ = readFileSync(`${pdir}/environ`);
-          if (!environ.includes("entry-http")) continue;
-          if (requireSocket && !ownsListeningSocket(pdir, listeningInodes)) continue;
           const match = environ.toString("utf8").split("\0").find((kv) => kv.startsWith("ZCODE_SERVER_AUTH_TOKEN="));
-          if (match) return match.slice("ZCODE_SERVER_AUTH_TOKEN=".length).trim();
+          if (!match) continue;
+          if (requireSocket && !ownsListeningSocket(pdir, listeningInodes)) continue;
+          return match.slice("ZCODE_SERVER_AUTH_TOKEN=".length).trim();
         } catch {}
       }
       if (listeningInodes.size > 0 && requireSocket) continue; // try fallback pass
